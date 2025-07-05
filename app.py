@@ -3,11 +3,11 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 
 # === 1. Load the CDF file ===
-cdf_file = cdflib.CDF('data\data.cdf')
+cdf_file = cdflib.CDF('data/data.cdf')
 
 # === 2. Extract variables ===
 epoch = cdf_file.varget('epoch_for_cdf_mod')
@@ -20,19 +20,9 @@ zpos = cdf_file.varget('spacecraft_zpos')
 sun_angle = cdf_file.varget('sun_angle_tha2')
 
 # === 3. Convert epoch to datetime ===
-datetimes = cdflib.cdfepoch.to_datetime(epoch)
+datetimes = pd.to_datetime(cdflib.cdfepoch.to_datetime(epoch))
 
-# === 4. Print shapes for debugging ===
-print('datetimes:', np.shape(datetimes))
-print('flux:', np.shape(flux))
-print('energy:', np.shape(energy))
-print('flux_uncer:', np.shape(flux_uncer))
-print('xpos:', np.shape(xpos))
-print('ypos:', np.shape(ypos))
-print('zpos:', np.shape(zpos))
-print('sun_angle:', np.shape(sun_angle))
-
-# === 5. Feature engineering helpers ===
+# === 4. Feature engineering helpers ===
 def reduce_array(arr, stat='mean'):
     arr = np.asarray(arr)
     if arr.ndim == 1:
@@ -60,18 +50,14 @@ def reduce_array_3d(arr, stat='mean'):
         raise ValueError("Unknown stat")
 
 length = len(datetimes)
-# Truncate all arrays to the same length
-
 def truncate(arr):
     arr = np.asarray(arr)
     if arr.ndim == 0:
-        # Scalar: repeat to match length
         return np.full(length, arr)
     if arr.shape[0] >= length:
         return arr[:length]
     else:
         return np.pad(arr, (0, length - arr.shape[0]), constant_values=np.nan)
-
 
 flux = truncate(flux)
 energy = truncate(energy)
@@ -81,7 +67,7 @@ ypos = truncate(ypos)
 zpos = truncate(zpos)
 sun_angle = truncate(sun_angle)
 
-# === 6. Build features DataFrame ===
+# === 5. Build features DataFrame ===
 features = pd.DataFrame({
     'datetime': datetimes,
     'xpos': xpos,
@@ -97,73 +83,63 @@ features = pd.DataFrame({
     'sun_angle_std': reduce_array_3d(sun_angle, 'std'),
 })
 
-print(features.head())
-
-# === 7. AUTOMATED CME ARRIVAL DETECTION FROM IN-SITU DATA ===
-
-# 1. Compute the difference in flux_mean between consecutive time steps
+# === 6. Label current CME events (as before) ===
 features['flux_diff'] = features['flux_mean'].diff()
-
-# 2. Choose a threshold for a significant jump (adjust as needed)
-THRESHOLD = 5e6  # You may need to tune this value for your dataset
-
-# 3. Find indices where the difference exceeds the threshold
+THRESHOLD = 1e7
 cme_arrival_indices = features.index[features['flux_diff'] > THRESHOLD].tolist()
-
-# 4. Get the corresponding arrival times
 cme_arrival_times = features.loc[cme_arrival_indices, 'datetime'].tolist()
-print("Detected CME arrivals at:")
-for t in cme_arrival_times:
-    print(t)
-
-# 5. Label as CME within a window around each detected arrival
-label_window_hours = 12  # Label +/- 12 hours around each detected arrival
-features['label'] = 0  # default: no CME
-
+label_window_hours = 3
+features['label'] = 0
 for arrival_time in cme_arrival_times:
     window_start = arrival_time - pd.Timedelta(hours=label_window_hours)
     window_end = arrival_time + pd.Timedelta(hours=label_window_hours)
     features.loc[(features['datetime'] >= window_start) & (features['datetime'] <= window_end), 'label'] = 1
 
-print(features['label'].value_counts())
+# === 7. Forecasting: Create lagged features and future CME label ===
+# Define how many hours in the past and future to use
+history_hours = 24  # Use past 24 hours as input
+future_window = 24   # Predict CME in next 24 hours
 
+# Assume data is hourly; adjust if your cadence is different
+for lag in range(1, history_hours + 1):
+    for col in ['flux_mean', 'flux_max', 'flux_min', 'energy_mean', 'energy_max', 'energy_min', 'sun_angle_mean', 'sun_angle_std']:
+        features[f'{col}_lag_{lag}'] = features[col].shift(lag)
 
-# === 9. Train/test split and ML ===
-X = features.drop(['datetime', 'label'], axis=1)
-y = features['label']
+# Label: 1 if a CME occurs in the next 24 hours
+features['future_cme'] = features['label'].rolling(window=future_window, min_periods=1).max().shift(-future_window)
+features['future_cme'] = features['future_cme'].fillna(0).astype(int)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, random_state=42)
-clf = RandomForestClassifier(random_state=42)
+# Drop rows with NaN due to shifting
+features = features.dropna().reset_index(drop=True)
+
+# === 8. Train/test split and ML ===
+lagged_feature_cols = [col for col in features.columns if '_lag_' in col]
+X = features[lagged_feature_cols]
+y = features['future_cme']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, stratify=y, random_state=42, test_size=0.33
+)
+clf = RandomForestClassifier(random_state=42, class_weight='balanced')
 clf.fit(X_train, y_train)
 
-# === 10. Evaluate ===
+# === 9. Evaluate ===
 y_pred = clf.predict(X_test)
+print("Classification report for future CME prediction:")
 print(classification_report(y_test, y_pred))
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
 
-# === 11. Predict on new data point ===
-new_point = {
-    'xpos': 1.2e6,
-    'ypos': 2e5,
-    'zpos': -1e5,
-    'flux_mean': 1.5e6,
-    'flux_max': 2e6,
-    'flux_min': 1e5,
-    'energy_mean': 3500,
-    'energy_max': 4000,
-    'energy_min': 3000,
-    'sun_angle_mean': 0.1,
-    'sun_angle_std': 0.05
-}
-test_time = pd.Timestamp('2025/06/29 16:12')
-# Find the index of the closest datetime
-i_closest = (features['datetime'] - test_time).abs().idxmin()
-row = features.loc[i_closest]
+# === 10. Example: Predicting CME for a new time (using past 24 hours) ===
+# Let's pick the most recent row in the features DataFrame
+new_X = X.iloc[[-1]]
+future_prediction = clf.predict(new_X)[0]
+print(f"Prediction for the next {future_window} hours: {'CME likely' if future_prediction else 'No CME expected'}")
 
-new_point = row.drop(['datetime', 'label']).to_dict()
-print("CME detected" if clf.predict(pd.DataFrame([new_point]))[0] else "No CME detected")
-
-
-mask = (features['datetime'] > test_time - pd.Timedelta('2D')) & (features['datetime'] < test_time + pd.Timedelta('2D'))
-features[mask].plot(x='datetime', y='flux_mean')
-plt.axvline(test_time, color='red', linestyle='--')
+# === 11. Plotting: Label and prediction distribution ===
+plt.figure(figsize=(12, 4))
+plt.plot(features['datetime'], features['future_cme'], label='Future CME label')
+plt.xlabel('Time')
+plt.ylabel(f'CME in next {future_window}h')
+plt.title('CME Forecast Labels Over Time')
+plt.legend()
 plt.show()
